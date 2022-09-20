@@ -1,0 +1,1033 @@
+From ed09c62cf692c49d5430c93af230a49ef45433f4 Mon Sep 17 00:00:00 2001
+From: Niranjan Yadla <nyadla@usefulsensors.com>
+Date: Tue, 6 Sep 2022 15:24:02 -0700
+Subject: [PATCH] UsefulSensors:Leanky_relu optimization for ARC
+
+Enabled mli_krn_leaky_relu_fx8() fctn on TFLM
+---
+ Makefile                                      |   5 +-
+ examples/kernel_add_test/add_test.cc          | 608 +++++-------------
+ tensorflow/lite/micro/kernels/leaky_relu.cc   | 126 +++-
+ tensorflow/lite/micro/kernels/leaky_relu.h    |  17 +-
+ .../lite/micro/kernels/leaky_relu_common.cc   |  84 ++-
+ 5 files changed, 392 insertions(+), 448 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index de79809..e78a72b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -86,6 +86,7 @@ tensorflow/lite/micro/kernels/arc_mli/depthwise_conv.cc \
+ tensorflow/lite/micro/kernels/arc_mli/fully_connected.cc \
+ tensorflow/lite/micro/kernels/arc_mli/mli_interface.cc \
+ tensorflow/lite/micro/kernels/arc_mli/pooling.cc \
++tensorflow/lite/micro/kernels/leaky_relu.cc \
+ tensorflow/lite/micro/kernels/activations_common.cc \
+ tensorflow/lite/micro/kernels/activations.cc \
+ tensorflow/lite/micro/kernels/add_common.cc \
+@@ -127,7 +128,6 @@ tensorflow/lite/micro/kernels/kernel_util.cc \
+ tensorflow/lite/micro/kernels/l2norm.cc \
+ tensorflow/lite/micro/kernels/l2_pool_2d.cc \
+ tensorflow/lite/micro/kernels/leaky_relu_common.cc \
+-tensorflow/lite/micro/kernels/leaky_relu.cc \
+ tensorflow/lite/micro/kernels/log_softmax.cc \
+ tensorflow/lite/micro/kernels/logical.cc \
+ tensorflow/lite/micro/kernels/logical_common.cc \
+@@ -190,6 +190,9 @@ examples/id_model_test/main.cc \
+ examples/id_model_test/main_functions.cc \
+ 
+ KERNEL_ADD_TEST_SRCS := \
++tensorflow/lite/micro/kernels/arc_mli/scratch_buffers.cc \
++tensorflow/lite/micro/kernels/arc_mli/scratch_buf_mgr.cc \
++tensorflow/lite/micro/kernels/arc_mli/mli_slicers.cc \
+ examples/kernel_add_test/add_test.cc \
+ 
+ RF_SRCS := \
+diff --git a/examples/kernel_add_test/add_test.cc b/examples/kernel_add_test/add_test.cc
+index a1f19ff..1d7dcf7 100644
+--- a/examples/kernel_add_test/add_test.cc
++++ b/examples/kernel_add_test/add_test.cc
+@@ -1,4 +1,4 @@
+-/* Copyright 2019 The TensorFlow Authors. All Rights Reserved.
++/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+ 
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+@@ -13,11 +13,11 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
+-#include <cstdint>
++#include <limits>
++#include <type_traits>
+ 
+ #include "tensorflow/lite/c/builtin_op_data.h"
+ #include "tensorflow/lite/c/common.h"
+-#include "tensorflow/lite/micro/all_ops_resolver.h"
+ #include "tensorflow/lite/micro/kernels/kernel_runner.h"
+ #include "tensorflow/lite/micro/test_helpers.h"
+ #include "tensorflow/lite/micro/testing/micro_test.h"
+@@ -26,478 +26,216 @@ namespace tflite {
+ namespace testing {
+ namespace {
+ 
+-// Shapes and values for mixed broadcast tests.
+-constexpr int broadcast_output_dims_count = 36;
+-constexpr int broadcast_num_shapes = 4;
+-
+-int broadcast_input1_shape[] = {4, 2, 3, 1, 2};
+-const float broadcast_input1_values[] = {-0.3, 2.3, 0.9,  0.5, 0.8, -1.1,
+-                                         1.2,  2.8, -1.6, 0.0, 0.7, -2.2};
+-const float broadcast_input2_values[] = {0.2, 0.3, -0.4, 0.5, 1.0, 0.9};
+-const float
+-    broadcast_goldens[broadcast_num_shapes][broadcast_output_dims_count] = {
+-        {-0.1, 2.6,  -0.7, 2.8,  0.7,  3.2,  1.1, 0.8,  0.5, 1.0,  1.9, 1.4,
+-         1.0,  -0.8, 0.4,  -0.6, 1.8,  -0.2, 1.4, 3.1,  0.8, 3.3,  2.2, 3.7,
+-         -1.4, 0.3,  -2.0, 0.5,  -0.6, 0.9,  0.9, -1.9, 0.3, -1.7, 1.7, -1.3},
+-        {-0.1, 2.6, 0.5, 1.0, 1.8, -0.2, 1.4, 3.1, -2.0, 0.5, 1.7, -1.3},
+-        {-0.1, 2.5,  0.0,  2.6,  -0.7, 1.9,  1.1, 0.7,  1.2, 0.8,  0.5, 0.1,
+-         1.0,  -0.9, 1.1,  -0.8, 0.4,  -1.5, 1.7, 3.3,  2.2, 3.8,  2.1, 3.7,
+-         -1.1, 0.5,  -0.6, 1.0,  -0.7, 0.9,  1.2, -1.7, 1.7, -1.2, 1.6, -1.3},
+-        {-0.1, 2.5, 1.2, 0.8, 0.4, -1.5, 1.7, 3.3, -0.6, 1.0, 1.6, -1.3},
++// min/max are used to compute scale, zero-point, compare tolerance
++template <typename T>
++struct TestLeakyReluParams {
++  // general parameters
++  float alpha;  // alpha multiplier
++
++  // quantization parameters
++  float scale;      // quantization scale of input and output
++  int zero_point;   // quantization zero_point of input and output
++  T* input_data;    // quantized input storage
++  T* output_data;   // quantized output storage
++  float tolerance;  // output vs expected value tolerance
+ };
+ 
+-constexpr int broadcast_max_shape_size = 5;
+-int broadcast_input2_shapes[broadcast_num_shapes][broadcast_max_shape_size] = {
+-    {4, 1, 1, 3, 2},
+-    {4, 1, 3, 1, 2},
+-    {4, 2, 1, 3, 1},
+-    {4, 2, 3, 1, 1},
+-};
+-int broadcast_output_shapes[broadcast_num_shapes][broadcast_max_shape_size] = {
+-    {4, 2, 3, 3, 2},
+-    {4, 2, 3, 1, 2},
+-    {4, 2, 3, 3, 2},
+-    {4, 2, 3, 1, 2},
+-};
++void ExecuteLeakyReluTest(const float alpha, const int tensors_count,
++                          TfLiteTensor* tensors) {
++  TfLiteLeakyReluParams builtin_data = {};
++  builtin_data.alpha = alpha;
+ 
+-template <typename T>
+-void ValidateAddGoldens(TfLiteTensor* tensors, int tensors_size,
+-                        const T* golden, T* output, int output_size,
+-                        TfLiteFusedActivation activation,
+-                        float tolerance = 1e-5) {
+-  TfLiteAddParams builtin_data;
+-  builtin_data.activation = activation;
+-
+-  int inputs_array_data[] = {2, 0, 1};
+-  TfLiteIntArray* inputs_array = IntArrayFromInts(inputs_array_data);
+-  int outputs_array_data[] = {1, 2};
+-  TfLiteIntArray* outputs_array = IntArrayFromInts(outputs_array_data);
+-
+-  const TfLiteRegistration registration = Register_ADD();
+-  micro::KernelRunner runner(registration, tensors, tensors_size, inputs_array,
+-                             outputs_array, &builtin_data);
++  int kInputArrayData[] = {1, 0};
++  TfLiteIntArray* inputs_array = IntArrayFromInts(kInputArrayData);
++  int kOutputArrayData[] = {1, 1};
++  TfLiteIntArray* outputs_array = IntArrayFromInts(kOutputArrayData);
++
++  const TfLiteRegistration registration = tflite::Register_LEAKY_RELU();
++  micro::KernelRunner runner(registration, tensors, tensors_count, inputs_array,
++                             outputs_array, static_cast<void*>(&builtin_data));
+ 
+   TF_LITE_MICRO_EXPECT_EQ(kTfLiteOk, runner.InitAndPrepare());
+   TF_LITE_MICRO_EXPECT_EQ(kTfLiteOk, runner.Invoke());
+-
+-  for (int i = 0; i < output_size; ++i) {
+-    //TF_LITE_MICRO_EXPECT_NEAR(golden[i], output[i], tolerance);
+-      do {                                                                        
+-    auto vx = (golden[i]);                                                            
+-    auto vy = (output[i]);                                                            
+-    auto delta = ((vx) > (vy)) ? ((vx) - (vy)) : ((vy) - (vx));               
+-    if (vx != vy && delta > tolerance) {                                        
+-      MicroPrintf(" (%f) near " " (%f) failed at %s:%d",                
+-                  static_cast<double>(vx), static_cast<double>(vy), __FILE__, 
+-                  __LINE__);                                                  
+-      micro_test::did_test_fail = true;                                       
+-    }                                                                         
+-  } while (false);
+-  }
+ }
+ 
+-void TestAddFloat(int* input1_dims_data, const float* input1_data,
+-                  int* input2_dims_data, const float* input2_data,
+-                  int* output_dims_data, const float* expected_output,
+-                  TfLiteFusedActivation activation, float* output_data) {
+-  TfLiteIntArray* input1_dims = IntArrayFromInts(input1_dims_data);
+-  TfLiteIntArray* input2_dims = IntArrayFromInts(input2_dims_data);
+-  TfLiteIntArray* output_dims = IntArrayFromInts(output_dims_data);
+-
+-  constexpr int inputs_size = 2;
+-  constexpr int outputs_size = 1;
+-  constexpr int tensors_size = inputs_size + outputs_size;
+-  TfLiteTensor tensors[tensors_size] = {
+-      CreateTensor(input1_data, input1_dims),
+-      CreateTensor(input2_data, input2_dims),
++template <typename T>
++void TestLeakyRelu(const TestLeakyReluParams<T>& params, int* input_dims_data,
++                   const T* input_data, int* expected_dims,
++                   const T* expected_data, T* output_data) {
++  TfLiteIntArray* input_dims = IntArrayFromInts(input_dims_data);
++  TfLiteIntArray* output_dims = IntArrayFromInts(expected_dims);
++  const int output_count = ElementCount(*output_dims);
++
++  TfLiteTensor tensors[] = {
++      CreateTensor(input_data, input_dims),
+       CreateTensor(output_data, output_dims),
+   };
++  constexpr int tensors_count = std::extent<decltype(tensors)>::value;
++  ExecuteLeakyReluTest(params.alpha, tensors_count, tensors);
+ 
+-  ValidateAddGoldens(tensors, tensors_size, expected_output, output_data,
+-                     ElementCount(*output_dims), activation);
++  for (int i = 0; i < output_count; i++) {
++    TF_LITE_MICRO_EXPECT_EQ(expected_data[i], output_data[i]);
++  }
+ }
+ 
+ template <typename T>
+-void TestAddQuantized(int* input1_dims_data, const float* input1_data,
+-                      T* input1_quantized, float input1_scale,
+-                      int input1_zero_point, int* input2_dims_data,
+-                      const float* input2_data, T* input2_quantized,
+-                      float input2_scale, int input2_zero_point,
+-                      int* output_dims_data, const float* golden,
+-                      T* golden_quantized, float output_scale,
+-                      int output_zero_point, TfLiteFusedActivation activation,
+-                      T* output_data) {
+-  TfLiteIntArray* input1_dims = IntArrayFromInts(input1_dims_data);
+-  TfLiteIntArray* input2_dims = IntArrayFromInts(input2_dims_data);
+-  TfLiteIntArray* output_dims = IntArrayFromInts(output_dims_data);
+-  //MicroPrintf("Hello world...\n");
+- // printf("...Hello World\n\n");
+-  constexpr int inputs_size = 2;
+-  constexpr int outputs_size = 1;
+-  constexpr int tensors_size = inputs_size + outputs_size;
+-  TfLiteTensor tensors[tensors_size] = {
+-      tflite::testing::CreateQuantizedTensor(input1_data, input1_quantized,
+-                                             input1_dims, input1_scale,
+-                                             input1_zero_point),
+-      tflite::testing::CreateQuantizedTensor(input2_data, input2_quantized,
+-                                             input2_dims, input2_scale,
+-                                             input2_zero_point),
+-      tflite::testing::CreateQuantizedTensor(output_data, output_dims,
+-                                             output_scale, output_zero_point),
++void TestLeakyReluQuantized(const TestLeakyReluParams<T>& params,
++                            int* input_dims_data, const float* input_data,
++                            int* expected_dims, const float* expected_data,
++                            float* output_data) {
++  TfLiteIntArray* input_dims = IntArrayFromInts(input_dims_data);
++  TfLiteIntArray* output_dims = IntArrayFromInts(expected_dims);
++  const int output_count = ElementCount(*output_dims);
++
++  TfLiteTensor tensors[] = {
++      CreateQuantizedTensor(input_data, params.input_data, input_dims,
++                            params.scale, params.zero_point),
++      CreateQuantizedTensor(params.output_data, output_dims, params.scale,
++                            params.zero_point),
+   };
+-  tflite::Quantize(golden, golden_quantized, ElementCount(*output_dims),
+-                   output_scale, output_zero_point);
+-
+-  ValidateAddGoldens(tensors, tensors_size, golden_quantized, output_data,
+-                     ElementCount(*output_dims), activation);
+-}
+-
+-}  // namespace
+-}  // namespace testing
+-}  // namespace tflite
+-
+-TF_LITE_MICRO_TESTS_BEGIN
+-
+-TF_LITE_MICRO_TEST(FloatAddNoActivation) {
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8};
+-  const float input2_values[] = {0.1, 0.2, 0.3, 0.5};
+-  const float golden_values[] = {-1.9, 0.4, 1.0, 1.3};
+-  constexpr int output_dims_count = 4;
+-  float output_data[output_dims_count];
+-  tflite::testing::TestAddFloat(inout_shape, input1_values, inout_shape,
+-                                input2_values, inout_shape, golden_values,
+-                                kTfLiteActNone, output_data);
+-}
+-
+-TF_LITE_MICRO_TEST(FloatAddActivationRelu1) {
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8};
+-  const float input2_values[] = {0.1, 0.2, 0.3, 0.5};
+-  const float golden_values[] = {-1.0, 0.4, 1.0, 1.0};
+-
+-  constexpr int output_dims_count = 4;
+-  float output_data[output_dims_count];
+-  tflite::testing::TestAddFloat(inout_shape, input1_values, inout_shape,
+-                                input2_values, inout_shape, golden_values,
+-                                kTfLiteActReluN1To1, output_data);
++  constexpr int kTensorsCount = std::extent<decltype(tensors)>::value;
++  ExecuteLeakyReluTest(params.alpha, kTensorsCount, tensors);
++
++  Dequantize(params.output_data, output_count, params.scale, params.zero_point,
++             output_data);
++  const float kTolerance = params.tolerance;
++  for (int i = 0; i < output_count; i++) {
++    TF_LITE_MICRO_EXPECT_NEAR(expected_data[i], output_data[i], kTolerance);
++  }
+ }
+ 
+-TF_LITE_MICRO_TEST(FloatAddVariousInputShapes) {
+-  constexpr int output_dims_count = 6;
+-  float output_data[output_dims_count];
+-
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  const float input2_values[] = {0.1, 0.2, 0.3, 0.5, 1.1, 0.1};
+-  const float expected_output[] = {-1.9, 0.4, 1.0, 1.3, 2.2, 2.1};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
++// Our fixed-point math function implementations have roughly 12 bits of
++// accuracy, when specialized to 16-bit fixed-point arithmetic.
++// That is purely an implementation compromise, it would have been possible
++// to get closer to 16 bits of accuracy but that would be more expensive,
++// and not needed for our purposes as ultimately the output is either
++// immediately down-quantized to 8 bits, or will typically be at the output
++// of the surrounding LSTM cell.
++// So we can require roughly 2^-12 accuracy when the output is 16-bit, and
++// we can more or less expect the full 2^-8 accuracy when the output is 8-bit.
++//
++// However, the representable output interval is often [-1, 1]  (it has to be
++// for tanh, and even for logistic, when we implement it in fixed-point, we
++// typically have to do so on such a symmetric interval, e.g. ARM NEON only
++// has signed fixed-point arithmetic (SQRDMULH)).  As the width of [-1, 1]
++// is 2, our representable values are often diluted by a factor of 2, whence
++// the factor of 2 below.
++const float kQuantizedTolerance = 2 * (1. / 256);
++
++template <typename integer_dtype>
++void QuantizedActivationsOpTestLeakyRelu() {
++  int kDims[] = {2, 5, 5};
++  constexpr float kInput[] = {
++      -5.0f, -4.6f, -4.2f, -3.8f, -3.4f,  // Row 1
++      -3.0f, -2.6f, -2.2f, -1.8f, -1.4f,  // Row 2
++      -1.0f, -0.6f, -0.2f, 0.2f,  0.6f,   // Row 3
++      1.0f,  1.4f,  1.8f,  2.2f,  2.6f,   // Row 4
++      3.0f,  3.4f,  3.8f,  4.2f,  4.6f,   // Row 5
++  };
++  constexpr float kExpect[] = {
++      -0.50f, -0.46f, -0.42f, -0.38f, -0.34f,  // Row 1
++      -0.30f, -0.26f, -0.22f, -0.18f, -0.14f,  // Row 2
++      -0.10f, -0.06f, -0.02f, 0.20f,  0.60f,   // Row 3
++      1.00f,  1.40f,  1.80f,  2.20f,  2.60f,   // Row 4
++      3.00f,  3.40f,  3.80f,  4.20f,  4.60f,   // Row 5
+   };
++  constexpr int kOutputCount = std::extent<decltype(kExpect)>::value;
++  float output_data[kOutputCount];
+ 
+-  for (int i = 0; i < num_shapes; ++i) {
+-    tflite::testing::TestAddFloat(test_shapes[i], input1_values, test_shapes[i],
+-                                  input2_values, test_shapes[i],
+-                                  expected_output, kTfLiteActNone, output_data);
+-  }
+-}
++  // setup quantization storage and parameters
++  integer_dtype q_output_data[kOutputCount];
++  integer_dtype q_input_data[kOutputCount];
+ 
+-TF_LITE_MICRO_TEST(FloatAddWithScalarBroadcast) {
+-  constexpr int output_dims_count = 6;
+-  float output_data[output_dims_count];
+-
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  int input2_shape[] = {0};
+-  const float input2_values[] = {0.1};
+-  const float expected_output[] = {-1.9, 0.3, 0.8, 0.9, 1.2, 2.1};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
+-  };
++  constexpr float kMin = -1;
++  constexpr float kMax =
++      std::numeric_limits<integer_dtype>::max() /
++      static_cast<float>(std::numeric_limits<integer_dtype>::max() + 1);
++  // Quantize with a symmetric input / output range of {-5, 5}.
++  constexpr float kDataMin = 5 * kMin;
++  constexpr float kDataMax = 5 * kMax;
+ 
+-  for (int i = 0; i < num_shapes; ++i) {
+-    tflite::testing::TestAddFloat(test_shapes[i], input1_values, input2_shape,
+-                                  input2_values, test_shapes[i],
+-                                  expected_output, kTfLiteActNone, output_data);
+-  }
+-}
++  TestLeakyReluParams<integer_dtype> params = {};
++  params.alpha = 0.1f;
++  params.scale = ScaleFromMinMax<integer_dtype>(kDataMin, kDataMax);
++  params.zero_point = ZeroPointFromMinMax<integer_dtype>(kDataMin, kDataMax);
++  params.input_data = q_input_data;
++  params.output_data = q_output_data;
++  params.tolerance = kQuantizedTolerance * 5;
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddNoActivationInt8) {
+-  const float scales[] = {0.25, 0.5, 1.0};
+-  const int zero_points[] = {-10, 4, 13};
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.01, -1.01, -0.01, 0.98};
+-  const float input2_values[] = {1.01, 1.99, 2.99, 4.02};
+-  const float golden_values[] = {-1, 1, 3, 5};
+-
+-  constexpr int output_dims_count = 4;
+-  int8_t input1_quantized[output_dims_count];
+-  int8_t input2_quantized[output_dims_count];
+-  int8_t golden_quantized[output_dims_count];
+-  int8_t output[output_dims_count];
+-
+-  tflite::testing::TestAddQuantized(
+-      inout_shape, input1_values, input1_quantized, scales[0], zero_points[0],
+-      inout_shape, input2_values, input2_quantized, scales[1], zero_points[1],
+-      inout_shape, golden_values, golden_quantized, scales[2], zero_points[2],
+-      kTfLiteActNone, output);
++  TestLeakyReluQuantized(params, kDims, kInput, kDims, kExpect, output_data);
+ }
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddActivationRelu1Int8) {
+-  const float scales[] = {0.25, 0.5, 1.0};
+-  const int zero_points[] = {-10, 4, 13};
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.01, -1.01, -0.01, 0.98};
+-  const float input2_values[] = {1.01, 1.99, 2.99, 4.02};
+-  const float golden_values[] = {-1, 1, 1, 1};
+-
+-  constexpr int output_dims_count = 4;
+-  int8_t input1_quantized[output_dims_count];
+-  int8_t input2_quantized[output_dims_count];
+-  int8_t golden_quantized[output_dims_count];
+-  int8_t output[output_dims_count];
+-
+-  tflite::testing::TestAddQuantized(
+-      inout_shape, input1_values, input1_quantized, scales[0], zero_points[0],
+-      inout_shape, input2_values, input2_quantized, scales[1], zero_points[1],
+-      inout_shape, golden_values, golden_quantized, scales[2], zero_points[2],
+-      kTfLiteActReluN1To1, output);
+-}
++}  // namespace
++}  // namespace testing
++}  // namespace tflite
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddVariousInputShapesInt8) {
+-  const float scales[] = {0.1, 0.05, 0.1};
+-  const int zero_points[] = {-9, 5, 14};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
+-  };
++TF_LITE_MICRO_TESTS_BEGIN
+ 
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  const float input2_values[] = {0.1, 0.2, 0.3, 0.5, 1.1, 0.1};
+-  const float golden_values[] = {-1.9, 0.4, 1.0, 1.3, 2.2, 2.1};
+-
+-  constexpr int output_dims_count = 6;
+-  int8_t input1_quantized[output_dims_count];
+-  int8_t input2_quantized[output_dims_count];
+-  int8_t golden_quantized[output_dims_count];
+-  int8_t output[output_dims_count];
+-
+-  for (int i = 0; i < num_shapes; i++) {
+-    tflite::testing::TestAddQuantized(
+-        test_shapes[i], input1_values, input1_quantized, scales[0],
+-        zero_points[0], test_shapes[i], input2_values, input2_quantized,
+-        scales[1], zero_points[1], test_shapes[i], golden_values,
+-        golden_quantized, scales[2], zero_points[2], kTfLiteActNone, output);
+-  }
+-}
++TF_LITE_MICRO_TEST(QuantizedActivationsOpTestLeakyReluInt8_1) {
++  int kDims[] = {2, 2, 3};
++  constexpr float kInput[] = {0.0f, 1.0f, 3.0f, 1.0f, -1.0f, -2.0f};
++  constexpr float kExpect[] = {0.0f, 1.0f, 3.0f, 1.0f, -0.5f, -1.0f};
++  constexpr int kOutputCount = std::extent<decltype(kExpect)>::value;
++  float output_data[kOutputCount];
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddWithScalarBroadcastFloat) {
+-  float output_float[tflite::testing::broadcast_output_dims_count];
+-
+-  for (int i = 0; i < tflite::testing::broadcast_num_shapes; ++i) {
+-    tflite::testing::TestAddFloat(tflite::testing::broadcast_input1_shape,
+-                                  tflite::testing::broadcast_input1_values,
+-                                  tflite::testing::broadcast_input2_shapes[i],
+-                                  tflite::testing::broadcast_input2_values,
+-                                  tflite::testing::broadcast_output_shapes[i],
+-                                  tflite::testing::broadcast_goldens[i],
+-                                  kTfLiteActNone, output_float);
+-  }
+-}
++  // setup quantization storage and parameters
++  int8_t q_output_data[kOutputCount];
++  int8_t q_input_data[kOutputCount];
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddWithScalarBroadcastInt8) {
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  int input2_shape[] = {0};
+-  const float input2_values[] = {0.1};
+-  const float golden[] = {-1.9, 0.3, 0.8, 0.9, 1.2, 2.1};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
+-  };
++  tflite::testing::TestLeakyReluParams<int8_t> params = {};
++  params.alpha = 0.5f;
++  params.scale = 0.1f;
++  params.zero_point = 0;
++  params.input_data = q_input_data;
++  params.output_data = q_output_data;
++  params.tolerance = tflite::testing::kQuantizedTolerance;
+ 
+-  const float scales[] = {0.1, 0.05, 0.05};
+-  const int zero_points[] = {-8, 4, 12};
+-
+-  constexpr int output_dims_count = 6;
+-  int8_t input1_quantized[output_dims_count];
+-  int8_t input2_quantized[output_dims_count];
+-  int8_t golden_quantized[output_dims_count];
+-  int8_t output[output_dims_count];
+-
+-  for (int i = 0; i < num_shapes; ++i) {
+-    tflite::testing::TestAddQuantized(
+-        test_shapes[i], input1_values, input1_quantized, scales[0],
+-        zero_points[0], input2_shape, input2_values, input2_quantized,
+-        scales[1], zero_points[1], test_shapes[i], golden, golden_quantized,
+-        scales[2], zero_points[2], kTfLiteActNone, output);
+-  }
++  tflite::testing::TestLeakyReluQuantized(params, kDims, kInput, kDims, kExpect,
++                                          output_data);
+ }
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddWithMixedBroadcastInt8) {
+-  const float scales[] = {0.1, 0.05, 0.1};
+-  const int zero_points[] = {-10, -5, 7};
+-  int8_t input1_quantized[tflite::testing::broadcast_output_dims_count];
+-  int8_t input2_quantized[tflite::testing::broadcast_output_dims_count];
+-  int8_t golden_quantized[tflite::testing::broadcast_output_dims_count];
+-  int8_t output[tflite::testing::broadcast_output_dims_count];
+-
+-  for (int i = 0; i < tflite::testing::broadcast_num_shapes; ++i) {
+-    tflite::testing::TestAddQuantized(
+-        tflite::testing::broadcast_input1_shape,
+-        tflite::testing::broadcast_input1_values, input1_quantized, scales[0],
+-        zero_points[0], tflite::testing::broadcast_input2_shapes[i],
+-        tflite::testing::broadcast_input2_values, input2_quantized, scales[1],
+-        zero_points[1], tflite::testing::broadcast_output_shapes[i],
+-        tflite::testing::broadcast_goldens[i], golden_quantized, scales[2],
+-        zero_points[2], kTfLiteActNone, output);
+-  }
++TF_LITE_MICRO_TEST(QuantizedActivationsOpTestLeakyReluInt8_2) {
++  tflite::testing::QuantizedActivationsOpTestLeakyRelu<int8_t>();
+ }
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddNoActivationInt16) {
+-  const float scales[] = {0.25, 0.5, 1.0};
+-  const int zero_points[] = {0, 0, 0};
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.01, -1.01, -0.01, 0.98};
+-  const float input2_values[] = {1.01, 2.01, 3.01, 4.02};
+-  const float golden_values[] = {-1, 1, 3, 5};
+-
+-  constexpr int output_dims_count = 4;
+-  int16_t input1_quantized[output_dims_count];
+-  int16_t input2_quantized[output_dims_count];
+-  int16_t golden_quantized[output_dims_count];
+-  int16_t output[output_dims_count];
+-
+-  tflite::testing::TestAddQuantized(
+-      inout_shape, input1_values, input1_quantized, scales[0], zero_points[0],
+-      inout_shape, input2_values, input2_quantized, scales[1], zero_points[1],
+-      inout_shape, golden_values, golden_quantized, scales[2], zero_points[2],
+-      kTfLiteActNone, output);
+-}
++TF_LITE_MICRO_TEST(QuantizedActivationsOpTestLeakyReluInt16_1) {
++  int kDims[] = {2, 2, 3};
++  constexpr float kInput[] = {0.0f, 1.0f, 3.0f, 1.0f, -1.0f, -2.0f};
++  constexpr float kExpect[] = {0.0f, 1.0f, 3.0f, 1.0f, -0.5f, -1.0f};
++  constexpr int kOutputCount = std::extent<decltype(kExpect)>::value;
++  float output_data[kOutputCount];
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddActivationRelu1Int16) {
+-  const float scales[] = {0.25, 0.5, 1.0};
+-  const int zero_points[] = {0, 0, 0};
+-  int inout_shape[] = {4, 1, 2, 2, 1};
+-  const float input1_values[] = {-2.01, -1.01, -0.01, 0.98};
+-  const float input2_values[] = {1.01, 1.99, 2.99, 4.02};
+-  const float golden_values[] = {-1, 1, 1, 1};
+-
+-  constexpr int output_dims_count = 4;
+-  int16_t input1_quantized[output_dims_count];
+-  int16_t input2_quantized[output_dims_count];
+-  int16_t golden_quantized[output_dims_count];
+-  int16_t output[output_dims_count];
+-
+-  tflite::testing::TestAddQuantized(
+-      inout_shape, input1_values, input1_quantized, scales[0], zero_points[0],
+-      inout_shape, input2_values, input2_quantized, scales[1], zero_points[1],
+-      inout_shape, golden_values, golden_quantized, scales[2], zero_points[2],
+-      kTfLiteActReluN1To1, output);
+-}
++  // setup quantization storage and parameters
++  int16_t q_output_data[kOutputCount];
++  int16_t q_input_data[kOutputCount];
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddVariousInputShapesInt16) {
+-  const float scales[] = {0.1, 0.05, 0.1};
+-  const int zero_points[] = {0, 0, 0};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
+-  };
++  tflite::testing::TestLeakyReluParams<int16_t> params = {};
++  params.alpha = 0.5f;
++  params.scale = 0.01f;
++  params.zero_point = 0;
++  params.input_data = q_input_data;
++  params.output_data = q_output_data;
++  params.tolerance = tflite::testing::kQuantizedTolerance;
+ 
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  const float input2_values[] = {0.1, 0.2, 0.3, 0.5, 1.1, 0.1};
+-  const float golden_values[] = {-1.9, 0.4, 1.0, 1.3, 2.2, 2.1};
+-
+-  constexpr int output_dims_count = 6;
+-  int16_t input1_quantized[output_dims_count];
+-  int16_t input2_quantized[output_dims_count];
+-  int16_t golden_quantized[output_dims_count];
+-  int16_t output[output_dims_count];
+-
+-  for (int i = 0; i < num_shapes; i++) {
+-    tflite::testing::TestAddQuantized(
+-        test_shapes[i], input1_values, input1_quantized, scales[0],
+-        zero_points[0], test_shapes[i], input2_values, input2_quantized,
+-        scales[1], zero_points[1], test_shapes[i], golden_values,
+-        golden_quantized, scales[2], zero_points[2], kTfLiteActNone, output);
+-  }
++  tflite::testing::TestLeakyReluQuantized(params, kDims, kInput, kDims, kExpect,
++                                          output_data);
+ }
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddWithScalarBroadcastInt16) {
+-  const float input1_values[] = {-2.0, 0.2, 0.7, 0.8, 1.1, 2.0};
+-  int input2_shape[] = {0};
+-  const float input2_values[] = {0.1};
+-  const float golden[] = {-1.9, 0.3, 0.8, 0.9, 1.2, 2.1};
+-
+-  constexpr int num_shapes = 4;
+-  constexpr int max_shape_size = 5;
+-  int test_shapes[num_shapes][max_shape_size] = {
+-      {1, 6},
+-      {2, 2, 3},
+-      {3, 2, 1, 3},
+-      {4, 1, 3, 1, 2},
+-  };
+-
+-  const float scales[] = {0.1, 0.05, 0.05};
+-  const int zero_points[] = {0, 0, 0};
+-
+-  constexpr int output_dims_count = 6;
+-  int16_t input1_quantized[output_dims_count];
+-  int16_t input2_quantized[output_dims_count];
+-  int16_t golden_quantized[output_dims_count];
+-  int16_t output[output_dims_count];
+-
+-  for (int i = 0; i < num_shapes; ++i) {
+-    tflite::testing::TestAddQuantized(
+-        test_shapes[i], input1_values, input1_quantized, scales[0],
+-        zero_points[0], input2_shape, input2_values, input2_quantized,
+-        scales[1], zero_points[1], test_shapes[i], golden, golden_quantized,
+-        scales[2], zero_points[2], kTfLiteActNone, output);
+-  }
++TF_LITE_MICRO_TEST(QuantizedActivationsOpTestLeakyReluInt16_2) {
++  tflite::testing::QuantizedActivationsOpTestLeakyRelu<int16_t>();
+ }
+ 
+-TF_LITE_MICRO_TEST(QuantizedAddWithMixedBroadcastInt16) {
+-  const float scales[] = {0.1, 0.05, 0.1};
+-  const int zero_points[] = {0, 0, 0};
+-  int16_t input1_quantized[tflite::testing::broadcast_output_dims_count];
+-  int16_t input2_quantized[tflite::testing::broadcast_output_dims_count];
+-  int16_t golden_quantized[tflite::testing::broadcast_output_dims_count];
+-  int16_t output[tflite::testing::broadcast_output_dims_count];
+-
+-  for (int i = 0; i < tflite::testing::broadcast_num_shapes; ++i) {
+-    tflite::testing::TestAddQuantized(
+-        tflite::testing::broadcast_input1_shape,
+-        tflite::testing::broadcast_input1_values, input1_quantized, scales[0],
+-        zero_points[0], tflite::testing::broadcast_input2_shapes[i],
+-        tflite::testing::broadcast_input2_values, input2_quantized, scales[1],
+-        zero_points[1], tflite::testing::broadcast_output_shapes[i],
+-        tflite::testing::broadcast_goldens[i], golden_quantized, scales[2],
+-        zero_points[2], kTfLiteActNone, output);
+-  }
++TF_LITE_MICRO_TEST(FloatActivationsOpTestLeakyRelu) {
++  int kDims[] = {2, 2, 3};
++  constexpr float kInput[] = {0.0f, 1.0f, 3.0f, 1.0f, -1.0f, -2.0f};
++  constexpr float kExpect[] = {0.0f, 1.0f, 3.0f, 1.0f, -0.5f, -1.0f};
++  constexpr int kOutputCount = std::extent<decltype(kExpect)>::value;
++  float output_data[kOutputCount];
++  tflite::testing::TestLeakyReluParams<float> params = {};
++  params.alpha = 0.5f;
++
++  tflite::testing::TestLeakyRelu(params, kDims, kInput, kDims, kExpect,
++                                 output_data);
+ }
+ 
+ TF_LITE_MICRO_TESTS_END
+diff --git a/tensorflow/lite/micro/kernels/leaky_relu.cc b/tensorflow/lite/micro/kernels/leaky_relu.cc
+index 70ee385..e016331 100644
+--- a/tensorflow/lite/micro/kernels/leaky_relu.cc
++++ b/tensorflow/lite/micro/kernels/leaky_relu.cc
+@@ -26,6 +26,94 @@ limitations under the License.
+ 
+ namespace tflite {
+ 
++#ifdef TEST_ARC_MLI
++// Prepare MLI tensors and run Average or Max Pooling
++TfLiteStatus EvalMli(TfLiteContext* context, const TfLiteLeakyReluParams* params,
++                     const LeakyReluOpData& data, const TfLiteEvalTensor* input,
++                     TfLiteEvalTensor* slope_coeffs,
++                     TfLiteEvalTensor* output) {
++  ops::micro::MliTensorAttachBuffer<int8_t>(input, &data.mli_in);
++  ops::micro::MliTensorAttachBuffer<int8_t>(output, &data.mli_out);
++  ops::micro::MliTensorAttachBuffer<int8_t>(slope_coeffs, &data.mli_slope_coeff);
++
++  MicroPrintf("params->alpha:%f",params->alpha);
++
++  // Tensors for data in fast (local) memory and config to copy data from
++  // external to local memory
++  mli_mov_cfg_t copy_config;
++  mli_mov_cfg_for_copy(&copy_config);
++  mli_tensor in_local = *data.mli_in.MliTensor();
++  mli_tensor out_local = *data.mli_out.MliTensor();
++  mli_tensor slope_coeffs_local = *data.mli_slope_coeff.MliTensor();
++
++  ops::micro::MliTensorInterface in_local_interface(&in_local);
++  ops::micro::MliTensorInterface out_local_interface(&out_local);
++  ops::micro::MliTensorInterface slope_coeffs_local_interface(&slope_coeffs_local);
++
++
++  TF_LITE_ENSURE_STATUS(get_arc_scratch_buffer_for_eltwise_tensors(
++      context, &in_local_interface, &slope_coeffs_local_interface, &out_local_interface));
++
++/* allocate the local buffers, and compute the slice size */
++//TF_LITE_ENSURE(context, *in_local_interface.Rank() == 1 &&
++//                            *slope_coeffs_local_interface.Rank() == 1 &&
++  //                          *out_local_interface.Rank() == 1);
++
++uint32_t min_capacity = *in_local_interface.DataCapacity();
++min_capacity = std::min(min_capacity, *slope_coeffs_local_interface.DataCapacity());
++min_capacity = std::min(min_capacity, *out_local_interface.DataCapacity());
++
++const int slice_dim = 0;
++const int slice_size =
++    min_capacity / mli_hlp_tensor_element_size(out_local_interface.MliTensor());
++
++/* is_local indicates that the tensor is already in local memory,
++   so in that case the original tensor can be used,
++   and there is no need to copy it to the local tensor*/
++const bool input_is_local =
++    in_local_interface.Data<int8_t>() == data.mli_in.Data<int8_t>();
++
++const bool slope_coeffs_is_local =
++    slope_coeffs_local_interface.Data<int8_t>() == data.mli_slope_coeff.Data<int8_t>();
++const bool out_is_local =
++    out_local_interface.Data<int8_t>() == data.mli_out.Data<int8_t>();
++
++ops::micro::TensorSlicer input_slice(data.mli_in.MliTensor(), slice_dim,
++                                      slice_size);
++ops::micro::TensorSlicer slope_coeff_slice(data.mli_slope_coeff.MliTensor(), slice_dim,
++                                      slice_size);
++ops::micro::TensorSlicer out_slice(data.mli_out.MliTensor(), slice_dim,
++                                   slice_size);
++
++mli_tensor* input_tsr = input_is_local ? input_slice.Sub() : &in_local;
++mli_tensor* slope_coeffs_tsr = slope_coeffs_is_local ? slope_coeff_slice.Sub() : &slope_coeffs_local;
++mli_tensor* out_tsr = out_is_local ? out_slice.Sub() : &out_local;
++slope_coeffs_tsr->el_params.fx.frac_bits = 7;
++
++//MicroPrintf("slope_coeffs_tsr->data:%x",slope_coeffs_tsr->data);
++  MicroPrintf("mli tensor of slope coeffs Q7 fixed point :%x",*(slope_coeffs->data.int8));
++
++//slope_coeffs_tsr->data = (void*) &params->alpha;
++//MicroPrintf("slope_coeffs_tsr->data:%f",slope_coeffs_tsr->data);
++
++
++  //MicroPrintf("%x",*(slope_coeffs->data.f));
++
++  while (!out_slice.Done()) {
++    mli_mov_tensor_sync(input_slice.Sub(), &copy_config, input_tsr);
++    mli_mov_tensor_sync(slope_coeff_slice.Sub(), &copy_config, slope_coeffs_tsr);
++
++    mli_status res = mli_krn_leaky_relu_fx8(input_tsr, slope_coeffs_tsr, out_tsr);
++    MicroPrintf("res:%d",res);
++    mli_mov_tensor_sync(out_tsr, &copy_config, out_slice.Sub());
++    input_slice.Next();
++    slope_coeff_slice.Next();
++    out_slice.Next();
++  }
++
++  return kTfLiteOk;
++}
++#endif
+ template <typename T>
+ void QuantizeLeakyRelu(const LeakyReluOpData& data,
+                        const TfLiteEvalTensor* input,
+@@ -38,6 +126,7 @@ void QuantizeLeakyRelu(const LeakyReluOpData& data,
+   op_params.output_shift_alpha = data.output_shift_alpha;
+   op_params.output_multiplier_identity = data.output_multiplier_identity;
+   op_params.output_shift_identity = data.output_shift_identity;
++
+   reference_ops::QuantizeLeakyRelu(op_params,
+                                    tflite::micro::GetTensorShape(input),
+                                    tflite::micro::GetTensorData<T>(input),
+@@ -55,13 +144,30 @@ TfLiteStatus LeakyReluEval(TfLiteContext* context, TfLiteNode* node) {
+       tflite::micro::GetEvalInput(context, node, kInputTensor);
+   TfLiteEvalTensor* output =
+       tflite::micro::GetEvalOutput(context, node, kOutputTensor);
+-  const LeakyReluOpData& data = *static_cast<LeakyReluOpData*>(node->user_data);
+ 
++  const LeakyReluOpData& data = *static_cast<LeakyReluOpData*>(node->user_data);
++  LeakyReluParams op_params = {};
++  const auto* params =
++      static_cast<TfLiteLeakyReluParams*>(node->builtin_data);
++      TfLiteEvalTensor* slope_coeffs =
++          tflite::micro::GetEvalInput(context, node, params->alpha);
++//TfLiteEvalTensor slope_coeffs    ;
++  //        slope_coeffs.data.data = (float *)&params->alpha;
++    //      slope_coeffs.type = kTfLiteFloat32;
++  //  MicroPrintf("%f",(slope_coeffs->data.int8));
++  //  MicroPrintf("%f",*(slope_coeffs->data.int8));
++  //  MicroPrintf("fixed 8: %x\n", slope_coeffs->data.data);
++  //  MicroPrintf("fixed 8: %x\n", (int8_t*)&(slope_coeffs->data.int8));
++  //  MicroPrintf("tensor->data.int8:%x",*(slope_coeffs->data.int8));
++          MicroPrintf("Inside LeakyReluEval params->alpha:%f",params->alpha);
++          int8_t val_i8 = (int8_t)(params->alpha*(1<<7));
++          slope_coeffs->data.data = (int8_t *)&val_i8;
++          slope_coeffs->type = kTfLiteInt8;
++          MicroPrintf("Converted to Q7 fixed point tensor->data.int8:%x",*(slope_coeffs->data.int8));
++          //MicroPrintf("%f",*(slope_coeffs.data.data));
+   switch (input->type) {
+     case kTfLiteFloat32: {
+-      LeakyReluParams op_params = {};
+-      const auto* params =
+-          static_cast<TfLiteLeakyReluParams*>(node->builtin_data);
++
+ 
+       op_params.alpha = params->alpha;
+       reference_ops::LeakyRelu(op_params, tflite::micro::GetTensorShape(input),
+@@ -71,7 +177,17 @@ TfLiteStatus LeakyReluEval(TfLiteContext* context, TfLiteNode* node) {
+       return kTfLiteOk;
+     } break;
+     case kTfLiteInt8: {
+-      QuantizeLeakyRelu<int8_t>(data, input, output);
++#ifdef TEST_ARC_MLI
++      if (data.is_mli_applicable) {
++
++        MicroPrintf("\n Entering EvalMLI\n");
++        EvalMli(context, params, data, input,slope_coeffs, output);
++        MicroPrintf("\n Exiting EvalMLI\n");
++      }
++#else
++  QuantizeLeakyRelu<int8_t>(data, input, output);
++#endif
++
+       return kTfLiteOk;
+     } break;
+     case kTfLiteInt16: {
+diff --git a/tensorflow/lite/micro/kernels/leaky_relu.h b/tensorflow/lite/micro/kernels/leaky_relu.h
+index dfcd6e9..8a435fb 100644
+--- a/tensorflow/lite/micro/kernels/leaky_relu.h
++++ b/tensorflow/lite/micro/kernels/leaky_relu.h
+@@ -17,7 +17,14 @@ limitations under the License.
+ #define TENSORFLOW_LITE_MICRO_KERNELS_LEAKY_RELU_H_
+ 
+ #include "tensorflow/lite/c/common.h"
+-
++#include "mli_api.h"  // NOLINT
++#include "tensorflow/lite/micro/kernels/arc_mli/mli_slicers.h"
++#include "tensorflow/lite/micro/kernels/arc_mli/mli_tf_utils.h"
++#include "tensorflow/lite/micro/kernels/arc_mli/scratch_buf_mgr.h"
++#include "tensorflow/lite/micro/kernels/arc_mli/scratch_buffers.h"
++#include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
++
++#define TEST_ARC_MLI
+ namespace tflite {
+ 
+ // Input/output tensor index.
+@@ -32,6 +39,14 @@ struct LeakyReluOpData {
+   int32_t output_shift_identity;
+   int32_t input_zero_point;
+   int32_t output_zero_point;
++#ifdef TEST_ARC_MLI
++  // The result of checking if MLI optimized version of tensors can be used.
++  bool is_mli_applicable;
++  // Tensors in MLI format.
++  mutable ops::micro::MliTensorInterface mli_in;
++  mutable ops::micro::MliTensorInterface mli_out;
++  mutable ops::micro::MliTensorInterface mli_slope_coeff;
++#endif
+ };
+ 
+ TfLiteStatus CalculateOpDataLeakyRelu(TfLiteContext* context, TfLiteNode* node);
+diff --git a/tensorflow/lite/micro/kernels/leaky_relu_common.cc b/tensorflow/lite/micro/kernels/leaky_relu_common.cc
+index 21cc99f..499360b 100644
+--- a/tensorflow/lite/micro/kernels/leaky_relu_common.cc
++++ b/tensorflow/lite/micro/kernels/leaky_relu_common.cc
+@@ -27,7 +27,12 @@ namespace tflite {
+ // Input/output tensor index.
+ const int kInputTensor = 0;
+ const int kOutputTensor = 0;
+-
++#ifdef TEST_ARC_MLI
++bool IsMliApplicable(TfLiteContext* context, const TfLiteTensor* input) {
++  // MLI optimized version only supports int8_t datatype
++  return (input->type == kTfLiteInt8);
++}
++#endif
+ TfLiteStatus CalculateOpDataLeakyRelu(TfLiteContext* context,
+                                       TfLiteNode* node) {
+   TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
+@@ -37,18 +42,22 @@ TfLiteStatus CalculateOpDataLeakyRelu(TfLiteContext* context,
+   TfLiteTensor* output;
+   TF_LITE_ENSURE_OK(context,
+                     GetOutputSafe(context, node, kOutputTensor, &output));
+-  TF_LITE_ENSURE_TYPES_EQ(context, input->type, output->type);
+ 
++
++  TF_LITE_ENSURE_TYPES_EQ(context, input->type, output->type);
++  LeakyReluOpData* data = static_cast<LeakyReluOpData*>(node->user_data);
++  const auto* params =
++      static_cast<TfLiteLeakyReluParams*>(node->builtin_data);
++      float alpha_multiplier;
+   if (output->type == kTfLiteInt8 || output->type == kTfLiteInt16) {
+-    LeakyReluOpData* data = static_cast<LeakyReluOpData*>(node->user_data);
+-    const auto* params =
+-        static_cast<TfLiteLeakyReluParams*>(node->builtin_data);
++
++
+ 
+     data->input_zero_point = input->params.zero_point;
+     data->output_zero_point = output->params.zero_point;
+ 
+     int output_shift_alpha;
+-    double alpha_multiplier = static_cast<double>(
++    alpha_multiplier = static_cast<double>(
+         input->params.scale * params->alpha / output->params.scale);
+     QuantizeMultiplier(alpha_multiplier, &data->output_multiplier_alpha,
+                        &output_shift_alpha);
+@@ -60,7 +69,70 @@ TfLiteStatus CalculateOpDataLeakyRelu(TfLiteContext* context,
+     QuantizeMultiplier(identity_multiplier, &data->output_multiplier_identity,
+                        &output_shift_identity);
+     data->output_shift_identity = static_cast<int32_t>(output_shift_identity);
++  //  MicroPrintf("%d\n",data->input_zero_point);
++//    MicroPrintf("%d\n",data->output_zero_point);
++  //  MicroPrintf("input->params.scale%d\n",input->params.scale);
++  //  MicroPrintf("output->params.scale %d\n",output->params.scale);
++  }
++#ifdef TEST_ARC_MLI
++
++  data->is_mli_applicable = IsMliApplicable(context, input);
++  if (data->is_mli_applicable) {
++    MicroPrintf("\nEntering to prepare of is_mli_applicable");
++    data->mli_in = ops::micro::MliTensorInterface(static_cast<mli_tensor*>(
++        context->AllocatePersistentBuffer(context, sizeof(mli_tensor))));
++    data->mli_out = ops::micro::MliTensorInterface(static_cast<mli_tensor*>(
++        context->AllocatePersistentBuffer(context, sizeof(mli_tensor))));
++    data->mli_slope_coeff = ops::micro::MliTensorInterface(static_cast<mli_tensor*>(
++        context->AllocatePersistentBuffer(context, sizeof(mli_tensor))));
++//{Q3.4
++MicroPrintf("params->alpha %f\n",params->alpha);
++
++int8_t val_i8 = (int8_t)(params->alpha*(1<<7));
++//int8_t val_i8 = (int8_t)(params->alpha*(255));
++MicroPrintf("fixed 8: %x\n", val_i8);
++#if 0
++TfLiteTensor tensor;
++tensor.data.data = (int8_t *)&val_i8;
++tensor.dims = {-1};
++tensor.bytes = 1;
++tensor.type = kTfLiteInt8;
++tensor.params.scale = 0;
++tensor.params.zero_point = 0;
++MicroPrintf("tensor->data.int8:%x",*(tensor.data.int8));
++MicroPrintf("tensor->data.int8:%x",(tensor.data.int8));
++#endif
++//}
++    TfLiteTensor* slope_coeffs_tensor =
++        context->GetTensor(context, params->alpha);
++        slope_coeffs_tensor->data.data = (int8_t *)&val_i8;
++      //  MicroPrintf("fixed 8: %x\n", slope_coeffs_tensor->data.data);
++      //  MicroPrintf("fixed 8: %x\n", (int8_t *)&(slope_coeffs_tensor->data.data));
++        //slope_coeffs_tensor->is_variable = true;
++      //  slope_coeffs_tensor->params.scale = input->params.scale;
++      //  slope_coeffs_tensor->params.zero_point = input->params.zero_point;
++    ops::micro::ConvertToMliTensor(input, &data->mli_in);
++    ops::micro::ConvertToMliTensor(output, &data->mli_out);
++    ops::micro::ConvertToMliTensor(slope_coeffs_tensor, &data->mli_slope_coeff);
++    /* Flatten tensors to simplify the process (as we don't support
++     * broadcasting). */
++    data->mli_in.Shape()[0] =
++        mli_hlp_count_elem_num(data->mli_in.MliTensor(), 0);
++    data->mli_slope_coeff.Shape()[0] =
++        mli_hlp_count_elem_num(data->mli_slope_coeff.MliTensor(), 0);
++    data->mli_out.Shape()[0] =
++        mli_hlp_count_elem_num(data->mli_out.MliTensor(), 0);
++    data->mli_in.MemStride()[0] = data->mli_slope_coeff.MemStride()[0] = 1;
++    data->mli_out.MemStride()[0] = 1;
++    *data->mli_in.Rank() = *data->mli_slope_coeff.Rank() = 1;
++    *data->mli_out.Rank() = 1;
++
++    //ops::micro::ConvertToMliTensor(&tensor, &data->mli_slope_coeff);
++    MicroPrintf("tensor->data.int8:%x",*(slope_coeffs_tensor->data.int8));
++    MicroPrintf("\n Exiting to prepare of is_mli_applicable");
++
+   }
++#endif
+ 
+   return kTfLiteOk;
+ }
+-- 
+2.34.1
+
